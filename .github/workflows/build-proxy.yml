@@ -19,6 +19,8 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       ffmpeg_version: ${{ steps.check.outputs.ffmpeg_version }}
+      build_stamp: ${{ steps.check.outputs.build_stamp }}
+      release_tag: ${{ steps.check.outputs.release_tag }}
       should_build: ${{ steps.check.outputs.should_build }}
     steps:
       - name: Check whether the latest BtbN build is already released
@@ -36,8 +38,25 @@ jobs:
           echo "latest BtbN build tag: $version"
           echo "ffmpeg_version=$version" >> "$GITHUB_OUTPUT"
 
-          if gh release view "ffmpeg-$version" --repo "${{ github.repository }}" >/dev/null 2>&1; then
-            echo "ffmpeg-$version already released; skipping build"
+          # A timestamp-suffixed tag (rather than just "ffmpeg-$version")
+          # keeps every build's history addressable even when we rebuild for
+          # the same upstream ffmpeg version (e.g. re-running after a proxy
+          # source change) -- otherwise a same-version rebuild would either
+          # collide with or silently replace the previous release/tag.
+          build_stamp=$(date -u +%Y%m%d%H%M%S)
+          echo "build_stamp=$build_stamp" >> "$GITHUB_OUTPUT"
+          release_tag="ffmpeg-$version-$build_stamp"
+          echo "release_tag=$release_tag" >> "$GITHUB_OUTPUT"
+
+          # Only skip the build if a release already exists for this exact
+          # upstream ffmpeg version, regardless of build_stamp -- matches any
+          # tag starting with "ffmpeg-$version-" (all builds of that version
+          # share this prefix, since every tag now carries a unique stamp).
+          # `gh release list` outputs TITLE\tTYPE\tTAG NAME\tPUBLISHED
+          # (tab-separated) -- field 3 is the tag name, not field 1.
+          if gh release list --repo "${{ github.repository }}" --limit 200 \
+             | cut -f3 | grep -q "^ffmpeg-$version-"; then
+            echo "a release for ffmpeg-$version already exists; skipping build"
             echo "should_build=false" >> "$GITHUB_OUTPUT"
           else
             echo "no release for ffmpeg-$version yet; building"
@@ -145,7 +164,7 @@ jobs:
           $hash = (Get-FileHash "$pkgDir/$dllName" -Algorithm SHA256).Hash.ToLower()
           "$hash *$dllName" | Out-File -FilePath "$pkgDir/SHA256SUMS.txt" -Encoding ascii -NoNewline
 
-          $zipName = "ddagrab-proxy-${{ needs.check.outputs.ffmpeg_version }}-${{ matrix.arch }}.zip"
+          $zipName = "ddagrab-proxy-${{ needs.check.outputs.release_tag }}-${{ matrix.arch }}.zip"
           Compress-Archive -Path "$pkgDir/*" -DestinationPath "package/$zipName"
           Write-Host "packaged: package/$zipName"
 
@@ -158,15 +177,34 @@ jobs:
     needs: [check, build]
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            output/README.md
+          sparse-checkout-cone-mode: false
+
       - uses: actions/download-artifact@v4
         with:
           pattern: ddagrab-proxy-*
           path: dist
           merge-multiple: false
 
+      # The disclaimer (no warranty / no dangerous code / malicious-use
+      # prohibition / FFmpeg license note) lives in output/README.md as the
+      # single source of truth; reuse it verbatim as the release body rather
+      # than duplicating it in this workflow file.
+      - name: Build release notes from output/README.md
+        run: cp output/README.md RELEASE_NOTES.md
+
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ffmpeg-${{ needs.check.outputs.ffmpeg_version }}
-          name: "ddagrab proxy for ffmpeg ${{ needs.check.outputs.ffmpeg_version }}"
+          tag_name: ${{ needs.check.outputs.release_tag }}
+          name: "ddagrab proxy for ffmpeg ${{ needs.check.outputs.ffmpeg_version }} (built ${{ needs.check.outputs.build_stamp }})"
+          body_path: RELEASE_NOTES.md
           files: dist/**/*.zip
+          # Always keep GitHub's "Latest" label on the most recently
+          # published release (the default), so users landing on the repo
+          # get the newest build while every past build_stamp'd tag/release
+          # still exists and stays browsable in the Releases history.
+          make_latest: true
