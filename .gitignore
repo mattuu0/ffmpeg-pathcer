@@ -1,0 +1,5 @@
+/target
+capture-helper/target/
+ffmpeg-master-latest-win64-lgpl-shared/
+desktop-shot/output/
+/ffmpeg/

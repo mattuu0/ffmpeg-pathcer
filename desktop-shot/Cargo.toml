@@ -1,0 +1,31 @@
+[package]
+name = "desktop-shot"
+version = "0.1.0"
+edition = "2021"
+
+# secure desktop (Winlogon / UAC同意画面 / スクリーンセーバー) を含む各デスクトップを
+# Desktop Duplication API (DDA) でキャプチャできるかどうかを検証するための、
+# 最小構成のスタンドアロンバイナリ。SYSTEM権限 (PsExec -i -s 等) から起動して使う想定。
+#
+# capture-helper と同じく win_desktop_duplication クレート (AdapterFactory /
+# DesktopDuplicationApi / TextureReader) を使う。生DXGIを自前で組み立てると、
+# 複数の仮想ディスプレイアダプタが刺さった環境で誤ったアダプタ/出力を掴んで
+# DuplicateOutput1 が DXGI_ERROR_UNSUPPORTED になることがあるため。
+[[bin]]
+name = "desktop-shot"
+path = "src/main.rs"
+
+[dependencies]
+win_desktop_duplication = "0.10.11"
+windows = { version = "0.62.2", features = [
+    "Win32_Foundation",
+    "Win32_System_StationsAndDesktops",
+    "Win32_Security",
+] }
+png = "0.17"
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = 3
+strip = true

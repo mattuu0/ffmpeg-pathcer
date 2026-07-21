@@ -1,0 +1,27 @@
+[package]
+name = "capture-helper"
+version = "0.1.0"
+edition = "2021"
+
+# UAC同意プロンプト(セキュアデスクトップ)も含めてキャプチャするため、SYSTEM権限で
+# 起動されることを前提とした独立バイナリ。sender(Tauri GUI、通常権限)とは別プロセス。
+[[bin]]
+name = "capture-helper"
+path = "src/main.rs"
+
+[dependencies]
+win_desktop_duplication = "0.10.11"
+windows = { version = "0.62.2", features = [
+    "Win32_Graphics_Gdi",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Foundation",
+    "Win32_System_StationsAndDesktops",
+    "Win32_Security",
+] }
+rayon = "1.12.0"
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = 3
+strip = true

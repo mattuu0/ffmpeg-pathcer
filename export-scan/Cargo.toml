@@ -1,0 +1,8 @@
+[package]
+name = "export-scan"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+pelite = "0.10"
+anyhow = "1"
