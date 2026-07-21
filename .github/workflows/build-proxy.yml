@@ -1,3 +1,6 @@
+# Note: this file is intentionally re-touched occasionally to nudge GitHub
+# into re-scanning it after history rewrites (force pushes can leave the
+# Actions workflow index stale).
 name: Build ddagrab proxy DLL
 
 on:
