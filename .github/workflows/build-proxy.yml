@@ -1,0 +1,169 @@
+name: Build ddagrab proxy DLL
+
+on:
+  schedule:
+    # Once a day: cheap enough to just always check, and BtbN's "latest"
+    # master build (and thus the avfilter SONAME it ships) can change at any
+    # time without a corresponding tag/release we could otherwise watch.
+    - cron: "0 6 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      ffmpeg_version: ${{ steps.check.outputs.ffmpeg_version }}
+      should_build: ${{ steps.check.outputs.should_build }}
+    steps:
+      - name: Check whether the latest BtbN build is already released
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version=$(curl -s -H "User-Agent: ddagrab-proxy-ci" \
+            https://api.github.com/repos/BtbN/FFmpeg-Builds/releases/latest \
+            | jq -r .tag_name)
+          if [ -z "$version" ] || [ "$version" = "null" ]; then
+            echo "failed to determine latest BtbN release tag_name" >&2
+            exit 1
+          fi
+          echo "latest BtbN build tag: $version"
+          echo "ffmpeg_version=$version" >> "$GITHUB_OUTPUT"
+
+          if gh release view "ffmpeg-$version" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "ffmpeg-$version already released; skipping build"
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "no release for ffmpeg-$version yet; building"
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: check
+    if: needs.check.outputs.should_build == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            rust_target: x86_64-pc-windows-msvc
+            asset_substr: win64-lgpl-shared
+          - arch: arm64
+            rust_target: aarch64-pc-windows-msvc
+            asset_substr: winarm64-lgpl-shared
+
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust target
+        run: rustup target add ${{ matrix.rust_target }}
+
+      # ARM64 lib.exe/link.exe only ship when the ARM64 build tools component
+      # is installed; windows-latest's default VS install does not include it.
+      - name: Install VS ARM64 build tools
+        if: matrix.arch == 'arm64'
+        run: |
+          $vsInstaller = "C:\Program Files (x86)\Microsoft Visual Studio\Installer\vs_installer.exe"
+          Start-Process -FilePath $vsInstaller -ArgumentList @(
+            "modify", "--installPath", "C:\Program Files\Microsoft Visual Studio\2022\Enterprise",
+            "--add", "Microsoft.VisualStudio.Component.VC.Tools.ARM64",
+            "--quiet", "--norestart", "--nocache"
+          ) -Wait -PassThru
+
+      - name: Fetch latest BtbN ffmpeg LGPL build (${{ matrix.arch }})
+        id: fetch
+        shell: pwsh
+        run: |
+          $release = Invoke-RestMethod -Uri "https://api.github.com/repos/BtbN/FFmpeg-Builds/releases/latest" -Headers @{ "User-Agent" = "ddagrab-proxy-ci" }
+          $asset = $release.assets | Where-Object { $_.name -like "*${{ matrix.asset_substr }}*" -and $_.name -like "*.zip" } | Select-Object -First 1
+          if (-not $asset) {
+            Write-Error "no asset matching *${{ matrix.asset_substr }}*.zip found in latest BtbN release"
+            exit 1
+          }
+          Write-Host "using asset: $($asset.name)"
+          Invoke-WebRequest -Uri $asset.browser_download_url -OutFile ffmpeg.zip
+          Expand-Archive -Path ffmpeg.zip -DestinationPath ffmpeg-extracted
+          $binDir = Get-ChildItem -Path ffmpeg-extracted -Directory | Select-Object -First 1 | ForEach-Object { Join-Path $_.FullName "bin" }
+          $avfilterDll = Get-ChildItem -Path $binDir -Filter "avfilter-*.dll" | Select-Object -First 1
+          if (-not $avfilterDll) {
+            Write-Error "no avfilter-*.dll found under $binDir"
+            exit 1
+          }
+          Write-Host "found real DLL: $($avfilterDll.FullName) (SONAME stem: $($avfilterDll.BaseName))"
+          echo "real_dll_path=$($avfilterDll.FullName)" >> $env:GITHUB_OUTPUT
+          echo "soname_stem=$($avfilterDll.BaseName)" >> $env:GITHUB_OUTPUT
+
+      # Whichever host/target lib.exe matches this matrix leg's arch --
+      # avoids hardcoding a VS version/path the way a plain `lib.exe` PATH
+      # lookup would risk picking the wrong one.
+      - name: Locate matching lib.exe
+        id: libexe
+        shell: pwsh
+        run: |
+          $hostArch = "x64" # windows-latest runners are always x64 hosts
+          $targetArch = "${{ matrix.arch }}"
+          $vswhere = "C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vsPath = & $vswhere -latest -products * -requires Microsoft.Component.MSBuild -property installationPath
+          $libExe = Get-ChildItem -Path (Join-Path $vsPath "VC\Tools\MSVC") -Recurse -Filter "lib.exe" |
+            Where-Object { $_.FullName -like "*Host$hostArch\$targetArch\*" } |
+            Select-Object -First 1
+          if (-not $libExe) {
+            Write-Error "no lib.exe found for Host$hostArch\$targetArch under $vsPath"
+            exit 1
+          }
+          Write-Host "using lib.exe: $($libExe.FullName)"
+          echo "path=$($libExe.FullName)" >> $env:GITHUB_OUTPUT
+
+      - name: Build proxy DLL
+        env:
+          DDAGRAB_REAL_AVFILTER_DLL: ${{ steps.fetch.outputs.real_dll_path }}
+          DDAGRAB_LIB_EXE: ${{ steps.libexe.outputs.path }}
+        run: cargo build --release -p ddagrab_proxy --target ${{ matrix.rust_target }}
+
+      # Assembles the actual distributable: the DLL, its SHA256 (so users can
+      # verify the download wasn't corrupted/tampered with), and the
+      # disclaimer-bearing README -- all three always travel together, never
+      # the bare DLL alone.
+      - name: Stage package (DLL + SHA256SUMS.txt + README.md)
+        shell: pwsh
+        run: |
+          $sonameStem = "${{ steps.fetch.outputs.soname_stem }}"
+          $pkgDir = "package/${{ matrix.arch }}"
+          New-Item -ItemType Directory -Force -Path $pkgDir | Out-Null
+
+          $dllName = "$sonameStem.dll"
+          Copy-Item "target/${{ matrix.rust_target }}/release/ddagrab_proxy.dll" "$pkgDir/$dllName"
+          Copy-Item "output/README.md" "$pkgDir/README.md"
+
+          $hash = (Get-FileHash "$pkgDir/$dllName" -Algorithm SHA256).Hash.ToLower()
+          "$hash *$dllName" | Out-File -FilePath "$pkgDir/SHA256SUMS.txt" -Encoding ascii -NoNewline
+
+          $zipName = "ddagrab-proxy-${{ needs.check.outputs.ffmpeg_version }}-${{ matrix.arch }}.zip"
+          Compress-Archive -Path "$pkgDir/*" -DestinationPath "package/$zipName"
+          Write-Host "packaged: package/$zipName"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ddagrab-proxy-${{ matrix.arch }}
+          path: package/*.zip
+
+  release:
+    needs: [check, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: ddagrab-proxy-*
+          path: dist
+          merge-multiple: false
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ffmpeg-${{ needs.check.outputs.ffmpeg_version }}
+          name: "ddagrab proxy for ffmpeg ${{ needs.check.outputs.ffmpeg_version }}"
+          files: dist/**/*.zip

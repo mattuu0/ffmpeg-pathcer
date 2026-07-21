@@ -153,10 +153,12 @@ pub fn recreate_from_scratch() -> Result<Rebuilt> {
     // "how many live real duplication instances exist" invariant.
     let _guard = crate::state::DUPLICATE_OUTPUT_LOCK.lock();
 
+    let output_idx = *crate::state::LAST_OUTPUT_INDEX.lock();
+
     let device = create_device(&args)?;
     let dxgi_device = query_interface::<IDXGIDevice>(Interface::as_raw(&device), call_original_query_interface)?;
     let adapter = get_parent_adapter(&dxgi_device)?;
-    let output = enum_output(&adapter, 0)?;
+    let output = enum_output(&adapter, output_idx)?;
 
     // Prefer IDXGIOutput5::DuplicateOutput1 (matches ddagrab's own preference
     // when available), falling back to IDXGIOutput1::DuplicateOutput.

@@ -50,6 +50,7 @@ unsafe extern "system" fn hooked_enum_outputs(
 
     if hr.is_ok() && !ppoutput.is_null() && !(*ppoutput).is_null() {
         plog!("EnumOutputs succeeded (index {output}); wrapping DuplicateOutput");
+        *crate::state::LAST_OUTPUT_INDEX.lock() = output;
         install_output_hooks(*ppoutput);
     }
 

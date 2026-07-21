@@ -62,6 +62,14 @@ unsafe impl Send for DuplicationSource {}
 /// the device is the recovery path that actually works.
 pub static LAST_DUPLICATION_SOURCE: Mutex<Option<DuplicationSource>> = Mutex::new(None);
 
+/// The output index ddagrab itself asked `IDXGIAdapter::EnumOutputs` for
+/// (its `output_idx` option, default 0), captured at that call site
+/// (dxgi_adapter.rs) so `recovery::recreate_from_scratch` can re-enumerate
+/// the SAME output on a full rebuild instead of hardcoding index 0 -- with
+/// more than one monitor, defaulting to 0 there would silently start
+/// recapturing the wrong display after a full rebuild.
+pub static LAST_OUTPUT_INDEX: Mutex<u32> = Mutex::new(0);
+
 /// Global hook-installation lock: only one thread may install the
 /// D3D11CreateDevice hook / walk the QueryInterface->GetAdapter->EnumOutputs
 /// chain at a time, since these run at most once or twice per process

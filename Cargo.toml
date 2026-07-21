@@ -1,3 +1,12 @@
 [workspace]
 resolver = "2"
-members = ["proxy", "xtask", "deployer", "test-harness", "export-scan", "dda-probe", "desktop-shot"]
+members = [
+    "proxy",
+    "xtask",
+    "export-scan",
+    "poc/deployer",
+    "poc/test-harness",
+    "poc/dda-probe",
+    "poc/desktop-shot",
+    "poc/capture-helper",
+]

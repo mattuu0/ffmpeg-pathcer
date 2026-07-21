@@ -5,8 +5,7 @@ use std::process::Command;
 
 const DEFAULT_REAL_DLL: &str =
     "ffmpeg-master-latest-win64-lgpl-shared/bin/avfilter-12.dll";
-const REAL_DLL_STEM: &str = "avfilter-12_orig";
-const PROXY_DLL_STEM: &str = "avfilter-12";
+const ORIG_SUFFIX: &str = "_orig";
 
 fn main() {
     println!("cargo:rerun-if-env-changed=DDAGRAB_REAL_AVFILTER_DLL");
@@ -24,10 +23,23 @@ fn main() {
     if !real_dll_path.exists() {
         panic!(
             "real avfilter DLL not found at {}. Set DDAGRAB_REAL_AVFILTER_DLL to point at the \
-             genuine avfilter-12.dll to forward exports to.",
+             genuine avfilter-NN.dll to forward exports to.",
             real_dll_path.display()
         );
     }
+
+    // Derived from the real DLL's own filename (e.g. "avfilter-12.dll" ->
+    // stem "avfilter-12") rather than hardcoded, so a future libavfilter
+    // SONAME bump (avfilter-12.dll -> avfilter-13.dll etc, whenever ffmpeg
+    // changes libavfilter's major version) is picked up automatically just by
+    // pointing DDAGRAB_REAL_AVFILTER_DLL at the new DLL and rebuilding --
+    // no source change needed here.
+    let proxy_stem = real_dll_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or_else(|| panic!("could not determine file stem of {}", real_dll_path.display()))
+        .to_string();
+    let real_stem = format!("{proxy_stem}{ORIG_SUFFIX}");
 
     let exports = export_scan::read_named_exports(&real_dll_path)
         .expect("failed to read exports of real avfilter DLL");
@@ -40,18 +52,18 @@ fn main() {
 
     // 1. A plain (non-forwarding) .def naming the real DLL's own exports,
     //    used only to synthesize an import lib for it -- the forwarder
-    //    syntax in our proxy's .def ("name = avfilter-12_orig.name") requires
+    //    syntax in our proxy's .def ("name = <real_stem>.name") requires
     //    the linker be able to resolve symbols against *some* .lib for
-    //    avfilter-12_orig.dll, which doesn't ship one (only the .dll does).
-    let real_def_path = out_dir.join(format!("{REAL_DLL_STEM}.def"));
-    write_plain_def(&real_def_path, REAL_DLL_STEM, &exports);
+    //    the renamed real DLL, which doesn't ship one (only the .dll does).
+    let real_def_path = out_dir.join(format!("{real_stem}.def"));
+    write_plain_def(&real_def_path, &real_stem, &exports);
 
-    let real_lib_path = out_dir.join(format!("{REAL_DLL_STEM}.lib"));
-    generate_import_lib(&real_def_path, &real_lib_path, REAL_DLL_STEM);
+    let real_lib_path = out_dir.join(format!("{real_stem}.lib"));
+    generate_import_lib(&real_def_path, &real_lib_path, &real_stem);
 
     // 2. The proxy's own .def: every export forwards to the renamed real DLL.
-    let proxy_def_path = out_dir.join(format!("{PROXY_DLL_STEM}.def"));
-    write_forwarding_def(&proxy_def_path, PROXY_DLL_STEM, REAL_DLL_STEM, &exports);
+    let proxy_def_path = out_dir.join(format!("{proxy_stem}.def"));
+    write_forwarding_def(&proxy_def_path, &proxy_stem, &real_stem, &exports);
 
     println!("cargo:rustc-link-arg=/DEF:{}", proxy_def_path.display());
     println!("cargo:rustc-link-arg={}", real_lib_path.display());
@@ -60,8 +72,8 @@ fn main() {
         "cargo:warning=forwarding {} exports from {} to {}.dll (rename the real DLL to {}.dll before deploying)",
         exports.len(),
         real_dll_path.display(),
-        REAL_DLL_STEM,
-        REAL_DLL_STEM
+        real_stem,
+        real_stem
     );
 }
 
@@ -93,7 +105,7 @@ fn generate_import_lib(def_path: &Path, lib_path: &Path, dll_stem: &str) {
     let status = Command::new(&lib_exe)
         .arg(format!("/DEF:{}", def_path.display()))
         .arg(format!("/OUT:{}", lib_path.display()))
-        .arg("/MACHINE:X64")
+        .arg(format!("/MACHINE:{}", lib_machine_arg()))
         .arg(format!("/NAME:{dll_stem}.dll"))
         .current_dir(def_path.parent().unwrap())
         .status()
@@ -107,5 +119,20 @@ fn generate_import_lib(def_path: &Path, lib_path: &Path, dll_stem: &str) {
 
     if !status.success() {
         panic!("lib.exe failed generating import lib for {dll_stem}.dll (exit {status})");
+    }
+}
+
+/// `lib.exe`'s `/MACHINE` value for whatever target this crate is currently
+/// being built for -- read from Cargo's own `CARGO_CFG_TARGET_ARCH` (set for
+/// every build, not just cross-compiles) rather than hardcoded, so building
+/// with `--target aarch64-pc-windows-msvc` (for ARM64 ffmpeg builds) produces
+/// a correctly-matched import lib/proxy DLL without any build.rs changes.
+fn lib_machine_arg() -> &'static str {
+    match env::var("CARGO_CFG_TARGET_ARCH").as_deref() {
+        Ok("x86_64") => "X64",
+        Ok("aarch64") => "ARM64",
+        Ok("x86") => "X86",
+        Ok(other) => panic!("unsupported target arch for lib.exe /MACHINE: {other}"),
+        Err(_) => panic!("CARGO_CFG_TARGET_ARCH not set (expected when build.rs runs under cargo)"),
     }
 }

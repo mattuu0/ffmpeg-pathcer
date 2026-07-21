@@ -35,7 +35,7 @@ struct Args {
 
 fn parse_args() -> Args {
     let mut display_index = 0usize;
-    let mut out_dir = PathBuf::from("desktop-shot/output");
+    let mut out_dir = PathBuf::from("poc/desktop-shot/output");
     let mut interval_ms = 1000u64;
     let mut seconds = None;
 

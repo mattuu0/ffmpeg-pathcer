@@ -1,5 +1,6 @@
 /target
-capture-helper/target/
+poc/capture-helper/target/
 ffmpeg-master-latest-win64-lgpl-shared/
-desktop-shot/output/
+poc/desktop-shot/output/
 /ffmpeg/
+output/*.dll
