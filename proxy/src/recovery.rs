@@ -1,7 +1,8 @@
 use windows::core::{Error, Interface, Result, GUID};
 use windows::Win32::Graphics::Direct3D11::ID3D11Device;
 use windows::Win32::Graphics::Dxgi::{
-    IDXGIAdapter, IDXGIDevice, IDXGIOutput1, IDXGIOutput5, IDXGIOutputDuplication,
+    CreateDXGIFactory1, IDXGIAdapter, IDXGIDevice, IDXGIFactory1, IDXGIOutput1, IDXGIOutput5,
+    IDXGIOutputDuplication,
 };
 use windows::Win32::System::StationsAndDesktops::{
     CloseDesktop, GetUserObjectInformationW, OpenInputDesktop, SetThreadDesktop, UOI_NAME,
@@ -149,11 +150,51 @@ fn query_interface<T: Interface>(
     }
 }
 
+/// Gets the parent `IDXGIAdapter` for `device`, first checking whether the
+/// DXGI adapter/output topology has become stale (`IDXGIFactory1::IsCurrent`
+/// returning `false`) and, if so, re-fetching the SAME physical adapter (by
+/// `AdapterLuid`, which identifies a specific GPU and is stable across
+/// topology changes) from a freshly created `IDXGIFactory1` instead.
+///
+/// Why this check is necessary: confirmed via Windows PnP event logs that a
+/// virtual display adapter (Parsec's Virtual Display Adapter) tears down
+/// and recreates its display device (new PnP instance ID) across a rapid
+/// Winlogon<->Default desktop switch. Simply re-enumerating outputs on the
+/// SAME (possibly now-stale) `IDXGIAdapter` object was observed to still
+/// return a "successful" `DuplicateOutput1` against a duplication session
+/// that wasn't actually backed by a live display (its `ReleaseFrame`
+/// subsequently failed) -- i.e. the staleness lives one level up, on the
+/// adapter/factory itself, not just the specific `IDXGIOutput` object.
+/// `IsCurrent()` is DXGI's own purpose-built signal for exactly this
+/// situation (its documented use case is "an adapter was added or removed").
 fn get_parent_adapter(device: &IDXGIDevice) -> Result<IDXGIAdapter> {
-    unsafe {
+    let adapter: IDXGIAdapter = unsafe {
         let mut raw: *mut core::ffi::c_void = std::ptr::null_mut();
         call_original_get_parent(Interface::as_raw(device), &IDXGIAdapter::IID, &mut raw).ok()?;
-        Ok(Interface::from_raw(raw))
+        Interface::from_raw(raw)
+    };
+
+    let factory: IDXGIFactory1 = unsafe { adapter.GetParent()? };
+    if unsafe { factory.IsCurrent() }.as_bool() {
+        return Ok(adapter);
+    }
+
+    plog!("get_parent_adapter: DXGI topology is stale (IsCurrent()==false); re-creating factory/adapter");
+    let target_luid = unsafe { adapter.GetDesc()?.AdapterLuid };
+
+    let fresh_factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1() }?;
+    let mut index = 0u32;
+    loop {
+        let candidate: IDXGIAdapter = match unsafe { fresh_factory.EnumAdapters(index) } {
+            Ok(a) => a,
+            Err(e) => return Err(e),
+        };
+        let desc = unsafe { candidate.GetDesc()? };
+        if desc.AdapterLuid.LowPart == target_luid.LowPart && desc.AdapterLuid.HighPart == target_luid.HighPart {
+            plog!("get_parent_adapter: re-acquired the same physical adapter (luid match) from a fresh factory");
+            return Ok(candidate);
+        }
+        index += 1;
     }
 }
 
