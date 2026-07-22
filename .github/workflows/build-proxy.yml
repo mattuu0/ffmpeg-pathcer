@@ -9,6 +9,8 @@ on:
     # master build (and thus the avfilter SONAME it ships) can change at any
     # time without a corresponding tag/release we could otherwise watch.
     - cron: "0 6 * * *"
+  push:
+    branches: [master]
   workflow_dispatch: {}
 
 permissions:
@@ -22,10 +24,20 @@ jobs:
   # "Latest Auto-Build (2026-07-21 13:38)" that changes every time BtbN
   # re-builds master -- that's the identifier this job extracts and uses,
   # rather than the tag_name.
+  #
+  # This job's tag also always includes the short commit sha of THIS repo
+  # (e.g. "ffmpeg-2026-07-21_13-38-gabc1234"). A `schedule`/`workflow_dispatch`
+  # run only cares about a NEW BtbN build appearing (proxy source unchanged),
+  # so the sha makes each such run's tag distinct from a same-BtbN-version
+  # build triggered by a `push` (proxy source changed, BtbN unchanged) --
+  # without it, a push-triggered rebuild against an already-released BtbN
+  # version would either silently no-op (mistaking "same BtbN version" for
+  # "already built this proxy source") or clobber the prior release's tag.
   check:
     runs-on: ubuntu-latest
     outputs:
       ffmpeg_version: ${{ steps.check.outputs.ffmpeg_version }}
+      release_tag: ${{ steps.check.outputs.release_tag }}
       should_build: ${{ steps.check.outputs.should_build }}
     steps:
       - name: Extract the build timestamp from BtbN's release name
@@ -47,11 +59,23 @@ jobs:
           echo "build timestamp: $stamp"
           echo "ffmpeg_version=$stamp" >> "$GITHUB_OUTPUT"
 
-          if gh release view "ffmpeg-$stamp" --repo "${{ github.repository }}" >/dev/null 2>&1; then
-            echo "ffmpeg-$stamp already released; skipping build"
+          sha=$(echo "${{ github.sha }}" | cut -c1-7)
+          tag="ffmpeg-$stamp-g$sha"
+          echo "release tag: $tag"
+          echo "release_tag=$tag" >> "$GITHUB_OUTPUT"
+
+          # A `push` event means the proxy's OWN source changed -- always
+          # rebuild regardless of whether BtbN's version is one we've already
+          # built before (the sha in the tag keeps this from colliding with
+          # that prior release).
+          if [ "${{ github.event_name }}" = "push" ]; then
+            echo "push event; building unconditionally (source changed)"
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          elif gh release view "$tag" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "$tag already released; skipping build"
             echo "should_build=false" >> "$GITHUB_OUTPUT"
           else
-            echo "no release for ffmpeg-$stamp yet; building"
+            echo "no release for $tag yet; building"
             echo "should_build=true" >> "$GITHUB_OUTPUT"
           fi
 
@@ -156,7 +180,7 @@ jobs:
           $hash = (Get-FileHash "$pkgDir/$dllName" -Algorithm SHA256).Hash.ToLower()
           "$hash *$dllName" | Out-File -FilePath "$pkgDir/SHA256SUMS.txt" -Encoding ascii -NoNewline
 
-          $zipName = "ddagrab-proxy-ffmpeg-${{ needs.check.outputs.ffmpeg_version }}-${{ matrix.arch }}.zip"
+          $zipName = "ddagrab-proxy-${{ needs.check.outputs.release_tag }}-${{ matrix.arch }}.zip"
           Compress-Archive -Path "$pkgDir/*" -DestinationPath "package/$zipName"
           Write-Host "packaged: package/$zipName"
 
@@ -191,12 +215,14 @@ jobs:
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
-          # ffmpeg_version here is BtbN's own build timestamp (extracted from
-          # its release name, e.g. "2026-07-21_13-38"), not their fixed
-          # "latest" tag -- so this tag is unique per actual upstream build
-          # (never collides/overwrites across rebuilds) and tells a user
-          # exactly which BtbN build this DLL pairs with.
-          tag_name: ffmpeg-${{ needs.check.outputs.ffmpeg_version }}
-          name: "ddagrab proxy for ffmpeg (BtbN build ${{ needs.check.outputs.ffmpeg_version }})"
+          # release_tag combines BtbN's own build timestamp (e.g.
+          # "2026-07-21_13-38", extracted from its release name -- not their
+          # fixed "latest" tag) with this repo's own short commit sha, so it's
+          # unique both per upstream ffmpeg build AND per proxy source change
+          # -- a push-triggered rebuild against an already-released BtbN
+          # version gets its own distinct tag rather than colliding with (or
+          # being mistaken as a no-op duplicate of) the prior release.
+          tag_name: ${{ needs.check.outputs.release_tag }}
+          name: "ddagrab proxy for ffmpeg (BtbN build ${{ needs.check.outputs.ffmpeg_version }}, proxy ${{ needs.check.outputs.release_tag }})"
           body_path: RELEASE_NOTES.md
           files: dist/**/*.zip
