@@ -343,33 +343,36 @@ impl IDXGIOutputDuplication_Impl for DuplicationProxy_Impl {
 
 /// Shared recovery entry point for both the "last attempt already failed,
 /// retry now" path and the "just observed ACCESS_LOST/DENIED/INVALID_CALL"
-/// path above: always re-duplicates on the SAME device/output (never
-/// recreates the device from scratch).
+/// path above: always re-enumerates the output (via
+/// `IDXGIAdapter::EnumOutputs`) from the same `ID3D11Device` before
+/// re-duplicating, rather than reusing a cached `IDXGIOutput` object.
 ///
-/// A full `recreate_from_scratch` fallback used to exist here, but was
-/// removed after real-world UAC-transition testing (test-harness, 3x
-/// secure-desktop switches) proved it actively harmful: ddagrab itself keeps
-/// using the ORIGINAL `ID3D11Device` it was handed at filter-init time
-/// forever (`dda->device_hwctx->device` in vsrc_ddagrab.c), never learning
-/// about a replacement device this proxy might create. When
-/// `reduplicate_same_device` failed repeatedly during a secure-desktop
-/// transition (expected -- `OpenInputDesktop`/`DuplicateOutput1` legitimately
-/// fail while the desktop is switched away) and this proxy fell back to
-/// rebuilding the whole device from scratch, the freshly-acquired frame
-/// texture lived on a DIFFERENT device than ddagrab's own
-/// `ID3D11DeviceContext`. ddagrab's subsequent
-/// `ID3D11DeviceContext_CopySubresourceRegion` from that texture is then a
-/// cross-device copy, which silently fails and surfaces to ffmpeg as
-/// `AVERROR_EXTERNAL` -- observed in practice as ffmpeg exiting early with
-/// "Error during demuxing: Generic error in an external library" a few
-/// hundred ms after the from-scratch rebuild "succeeded". Retrying only the
-/// same-device path avoids this class of failure entirely: it either
-/// succeeds using the exact device ddagrab already has open, or it keeps
-/// failing (and retrying) until the desktop switch resolves -- which the
-/// test-harness run confirmed happens within roughly one second of the
-/// desktop returning to "Default".
+/// An earlier version of this function reused the cached `IDXGIOutput`
+/// directly (`reduplicate_same_device`, cheaper, no re-enumeration). That
+/// works for the common case (a UAC prompt/secure-desktop transition on a
+/// normal physical monitor, where the display itself never actually changes
+/// underneath) but was proven insufficient by a real crash report: Windows
+/// PnP event logs (`Microsoft-Windows-Kernel-PnP/Configuration`) confirmed
+/// that virtual display adapters (Parsec's Virtual Display Adapter) tear
+/// down and recreate their display device with a NEW PnP instance ID across
+/// a rapid Winlogon<->Default switch. `DuplicateOutput1` against the STALE
+/// cached `IDXGIOutput` still returned success in that case -- it was the
+/// SUBSEQUENT `ReleaseFrame` call that failed (ddagrab surfaced this as a
+/// fatal `AVERROR_EXTERNAL`, "DDA ReleaseFrame failed!"), well after
+/// recovery had already reported itself successful. Since a stale-but-still-
+/// "successful" DuplicateOutput1 call can't be distinguished from a healthy
+/// one at the point recovery runs, the only reliable fix is to never trust
+/// the cached output at all: always re-enumerate fresh, every recovery.
+///
+/// The `ID3D11Device` itself is still never re-created (that fallback,
+/// `recreate_from_scratch`, was removed separately after real-world UAC
+/// testing showed ddagrab keeps using its ORIGINAL device forever --
+/// `dda->device_hwctx->device` in vsrc_ddagrab.c -- so a frame acquired via
+/// a different device ends up copied through ddagrab's own, different,
+/// `ID3D11DeviceContext`, a cross-device `CopySubresourceRegion` that
+/// silently fails).
 fn try_recover() -> Result<crate::recovery::Rebuilt> {
-    crate::recovery::reduplicate_same_device()
+    crate::recovery::renumerate_output_and_duplicate()
 }
 
 // Keep IUnknownImpl referenced for the trait bound docs above; the

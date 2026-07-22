@@ -12,3 +12,10 @@ poc/__pycache__/
 poc/*.log
 poc/*.out
 /test_output.log
+
+# ddagrab_proxy.log lands next to the proxy DLL when it's run from the repo
+# root (e.g. pasted here by the user for debugging); the ffmpeg-side log
+# report-tool paths (rust-castsender etc.) are similarly pasted diagnostics,
+# not source.
+/ddagrab_proxy.log
+/Users*ffmpeg-level*
