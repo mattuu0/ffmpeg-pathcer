@@ -1,7 +1,8 @@
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
+
+use parking_lot::Mutex;
 
 use windows::core::{implement, IUnknownImpl, Interface, OutRef, Result};
 use windows::Win32::Foundation::RECT;
@@ -59,6 +60,21 @@ pub struct DuplicationProxy {
     /// means every AcquireNextFrame call returns WAIT_TIMEOUT until a later
     /// call's own recovery attempt succeeds.
     real: Mutex<Option<IDXGIOutputDuplication>>,
+    /// The SPECIFIC real instance a currently-locked frame was acquired
+    /// from, set at the end of a successful `AcquireNextFrame` and cleared
+    /// by `ReleaseFrame`. `GetFramePointerShape`/`ReleaseFrame` must operate
+    /// on THIS instance, not whatever `real` happens to hold at the moment
+    /// they're called -- if recovery replaces `real` with a freshly
+    /// re-duplicated instance while a frame from the OLD instance is still
+    /// locked (observed under rapid repeated Winlogon<->Default switching:
+    /// ACCESS_LOST can fire again, and recovery run, before ddagrab's own
+    /// GetFramePointerShape/ReleaseFrame for the frame it already acquired
+    /// have been called), calling ReleaseFrame on the new instance instead
+    /// of the one that actually holds the lock is an invalid call on that
+    /// new instance and fails -- which ddagrab surfaces as a fatal
+    /// `AVERROR_EXTERNAL` (logged as "DDA ReleaseFrame failed!"), killing
+    /// capture outright instead of just missing one frame.
+    locked_frame_owner: Mutex<Option<IDXGIOutputDuplication>>,
     source: Mutex<DuplicationSource>,
     desc: DXGI_OUTDUPL_DESC,
     // DIAGNOSTIC: tallies of what ddagrab's own AcquireNextFrame calls
@@ -91,6 +107,7 @@ pub unsafe fn wrap_duplication(ppoutputduplication: *mut *mut c_void, source: Du
 
     let proxy = DuplicationProxy {
         real: Mutex::new(Some(real)),
+        locked_frame_owner: Mutex::new(None),
         source: Mutex::new(source),
         desc,
         stats_calls: AtomicU64::new(0),
@@ -145,7 +162,7 @@ impl IDXGIOutputDuplication_Impl for DuplicationProxy_Impl {
         self.stats_calls.fetch_add(1, Ordering::Relaxed);
         self.stats_last_timeout_ms.store(timeoutinmilliseconds as u64, Ordering::Relaxed);
 
-        let mut real_guard = self.real.lock().unwrap();
+        let mut real_guard = self.real.lock();
 
         // If the last call's recovery attempt itself failed, `real_guard` is
         // `None` here -- retry recovery on THIS call too, rather than just
@@ -161,7 +178,7 @@ impl IDXGIOutputDuplication_Impl for DuplicationProxy_Impl {
                     self.stats_recoveries.fetch_add(1, Ordering::Relaxed);
                     plog!("[DuplicationProxy::AcquireNextFrame] recovered inline (retry of a previously failed recovery)");
                     *crate::state::LAST_DUPLICATION_SOURCE.lock() = Some(rebuilt.source.clone());
-                    *self.source.lock().unwrap() = rebuilt.source;
+                    *self.source.lock() = rebuilt.source;
                     *real_guard = Some(rebuilt.duplication);
                 }
                 Err(e) => {
@@ -183,16 +200,19 @@ impl IDXGIOutputDuplication_Impl for DuplicationProxy_Impl {
                 let mut resource: Option<IDXGIResource> = None;
                 let raw_out_ptr: *mut Option<IDXGIResource> = &mut resource;
                 unsafe { real.AcquireNextFrame(timeoutinmilliseconds, &mut frame_info, raw_out_ptr) }
-                    .map(|()| (frame_info, resource))
+                    .map(|()| (frame_info, resource, real.clone()))
             }
             None => Err(windows::core::Error::from(DXGI_ERROR_WAIT_TIMEOUT)),
         };
 
         let final_result = match result {
-            Ok((frame_info, resource)) => {
+            Ok((frame_info, resource, owner)) => {
                 unsafe { *pframeinfo = frame_info };
                 ppdesktopresource.write(resource)?;
                 self.stats_hits.fetch_add(1, Ordering::Relaxed);
+                // Remember exactly which instance this frame's lock belongs
+                // to -- see the `locked_frame_owner` field doc comment.
+                *self.locked_frame_owner.lock() = Some(owner);
                 Ok(())
             }
             Err(e) if e.code() == DXGI_ERROR_WAIT_TIMEOUT => {
@@ -218,7 +238,7 @@ impl IDXGIOutputDuplication_Impl for DuplicationProxy_Impl {
                         self.stats_recoveries.fetch_add(1, Ordering::Relaxed);
                         plog!("[DuplicationProxy::AcquireNextFrame] recovered inline");
                         *crate::state::LAST_DUPLICATION_SOURCE.lock() = Some(rebuilt.source.clone());
-                        *self.source.lock().unwrap() = rebuilt.source;
+                        *self.source.lock() = rebuilt.source;
                         *real_guard = Some(rebuilt.duplication);
                     }
                     Err(e2) => {
@@ -231,7 +251,7 @@ impl IDXGIOutputDuplication_Impl for DuplicationProxy_Impl {
             Err(e) => Err(e),
         };
 
-        if let Ok(mut window_start) = self.stats_window_start.try_lock() {
+        if let Some(mut window_start) = self.stats_window_start.try_lock() {
             if window_start.elapsed() >= Duration::from_secs(1) {
                 let calls = self.stats_calls.swap(0, Ordering::Relaxed);
                 let hits = self.stats_hits.swap(0, Ordering::Relaxed);
@@ -263,13 +283,14 @@ impl IDXGIOutputDuplication_Impl for DuplicationProxy_Impl {
     }
 
     fn GetFramePointerShape(&self, pointershapebuffersize: u32, ppointershapebuffer: *mut c_void, ppointershapebuffersizerequired: *mut u32, pshapeinfo: *mut DXGI_OUTDUPL_POINTER_SHAPE_INFO) -> Result<()> {
-        // Straight passthrough -- only valid while the frame AcquireNextFrame
-        // just returned is still locked, which holds since ddagrab only
-        // calls this between AcquireNextFrame and ReleaseFrame on the same
-        // thread, and `real` hasn't changed out from under it in between
-        // (no other thread ever touches `real` in this design).
-        let real_guard = self.real.lock().unwrap();
-        match real_guard.as_ref() {
+        // Only valid while the frame AcquireNextFrame just returned is still
+        // locked -- must operate on THAT specific instance
+        // (`locked_frame_owner`), not whatever `self.real` currently holds:
+        // under rapid repeated desktop switching, `self.real` can already
+        // have moved on to a freshly recovered instance by the time this is
+        // called (see `locked_frame_owner`'s field doc comment).
+        let owner_guard = self.locked_frame_owner.lock();
+        match owner_guard.as_ref() {
             Some(real) => {
                 let result = unsafe {
                     real.GetFramePointerShape(pointershapebuffersize, ppointershapebuffer, ppointershapebuffersizerequired, pshapeinfo)
@@ -289,7 +310,7 @@ impl IDXGIOutputDuplication_Impl for DuplicationProxy_Impl {
             }
             None => {
                 unsafe { *ppointershapebuffersizerequired = 0 };
-                plog!("[DuplicationProxy::GetFramePointerShape] real is None; reporting size=0");
+                plog!("[DuplicationProxy::GetFramePointerShape] no locked frame owner; reporting size=0");
                 Ok(())
             }
         }
@@ -306,15 +327,14 @@ impl IDXGIOutputDuplication_Impl for DuplicationProxy_Impl {
     }
 
     fn ReleaseFrame(&self) -> Result<()> {
-        // Straight passthrough. If recovery replaced `real` since the
-        // matching AcquireNextFrame (only possible if THIS call somehow
-        // raced a recovery, which can't happen -- both run on ddagrab's one
-        // calling thread, never concurrently), there would be nothing valid
-        // to release; but ordering guarantees that can't occur, so this is
-        // always releasing the same instance the prior AcquireNextFrame
-        // call acquired from.
-        let real_guard = self.real.lock().unwrap();
-        match real_guard.as_ref() {
+        // Must release the SAME instance the matching AcquireNextFrame
+        // acquired from (`locked_frame_owner`), not whatever `self.real`
+        // currently holds -- see `locked_frame_owner`'s field doc comment
+        // for why these can differ under rapid repeated desktop switching.
+        // Calling ReleaseFrame on the wrong (never-acquired-from) instance
+        // returns a failure HRESULT that ddagrab treats as fatal.
+        let owner = self.locked_frame_owner.lock().take();
+        match owner {
             Some(real) => unsafe { real.ReleaseFrame() },
             None => Ok(()),
         }
