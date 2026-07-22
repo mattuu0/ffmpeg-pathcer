@@ -82,12 +82,14 @@ pub static INSTALL_LOCK: Mutex<()> = Mutex::new(());
 /// of situation that produces an instance whose own AcquireNextFrame then
 /// fails forever. There are three call sites that can invoke the REAL
 /// DuplicateOutput/DuplicateOutput1: ddagrab's own initial call (hooked in
-/// dxgi_output.rs), and the pump thread's two recovery paths
-/// (`reduplicate_same_device` / `recreate_from_scratch`). Holding this lock
-/// across every one of them guarantees at most one real duplication attempt
-/// -- and therefore at most one live real IDXGIOutputDuplication instance --
-/// exists at any instant, process-wide, no matter which thread is driving
-/// recovery or how ddagrab itself happens to call in.
+/// dxgi_output.rs), and the two recovery paths (`reduplicate_same_device` /
+/// `recreate_from_scratch`), now run inline from
+/// `DuplicationProxy::AcquireNextFrame` on ddagrab's own calling thread
+/// rather than a dedicated pump thread. Holding this lock across every one
+/// of them guarantees at most one real duplication attempt -- and therefore
+/// at most one live real IDXGIOutputDuplication instance -- exists at any
+/// instant, process-wide, regardless of how ddagrab itself happens to call
+/// in.
 pub static DUPLICATE_OUTPUT_LOCK: Mutex<()> = Mutex::new(());
 
 pub type RawPtr = *mut c_void;

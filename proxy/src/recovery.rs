@@ -1,20 +1,14 @@
-use windows::core::{Error, Interface, Result, GUID};
+use windows::core::{Error, Interface, Result};
 use windows::Win32::Graphics::Direct3D11::ID3D11Device;
-use windows::Win32::Graphics::Dxgi::{
-    IDXGIAdapter, IDXGIDevice, IDXGIOutput1, IDXGIOutput5, IDXGIOutputDuplication,
-};
+use windows::Win32::Graphics::Dxgi::{IDXGIOutput1, IDXGIOutput5, IDXGIOutputDuplication};
 use windows::Win32::System::StationsAndDesktops::{
     CloseDesktop, GetUserObjectInformationW, OpenInputDesktop, SetThreadDesktop, UOI_NAME,
     DESKTOP_ACCESS_FLAGS, DF_ALLOWOTHERACCOUNTHOOK,
 };
 use windows::Win32::System::Threading::GetCurrentThreadId;
 
-use crate::hooks::d3d11_device::call_original_d3d11_create_device;
-use crate::hooks::dxgi_adapter::call_original_enum_outputs;
-use crate::hooks::dxgi_device::{call_original_get_parent, call_original_query_interface};
-use crate::hooks::dxgi_output::call_original_output_query_interface;
 use crate::logging::plog;
-use crate::state::{DeviceCreateArgs, DuplicationSource};
+use crate::state::DuplicationSource;
 
 std::thread_local! {
     static ATTACHED_THIS_THREAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -68,17 +62,22 @@ pub struct Rebuilt {
 /// across repeated Default<->Winlogon transitions using exactly this
 /// device-reuse strategy -- including capturing secure-desktop frames.
 ///
-/// A previous version of this module instead called `D3D11CreateDevice`
-/// fresh on every recovery (`recreate_from_scratch`, still below). That
-/// repeatedly produced a duplication instance whose very first
-/// AcquireNextFrame itself failed with ACCESS_LOST, over and over, and the
-/// failure persisted even long after the desktop had returned to Default --
-/// consistent with repeated full device re-creation exhausting or wedging
-/// some GPU/driver-side duplication registration that `desktop-shot` (which
-/// never re-creates the device) does not hit. So: try the lightweight,
-/// device-reusing path first, and only fall back to a full from-scratch
-/// rebuild if this device/output pairing itself has gone bad (e.g. after a
-/// display-mode change server-side, which DOES require a new device).
+/// A previous version of this module fell back to calling
+/// `D3D11CreateDevice` fresh (`recreate_from_scratch`) whenever this
+/// function failed repeatedly (e.g. while stuck on the secure desktop during
+/// a UAC prompt). That fallback was removed entirely after real-world
+/// UAC-transition testing: ddagrab itself keeps using the ORIGINAL
+/// `ID3D11Device` it was handed at filter-init time for the rest of the
+/// process's life and never learns about a replacement device created here,
+/// so a frame acquired via a freshly-recreated device ends up being copied
+/// through ddagrab's OWN (different) `ID3D11DeviceContext` --
+/// `ID3D11DeviceContext_CopySubresourceRegion` across two distinct devices
+/// silently fails, which ddagrab then surfaces as a fatal
+/// `AVERROR_EXTERNAL`, killing capture outright. This function is now the
+/// ONLY recovery path: it either succeeds by reusing ddagrab's own device,
+/// or it keeps failing (and getting retried by the caller) until the
+/// desktop switch resolves -- confirmed to resolve within about a second of
+/// the input desktop returning to "Default".
 pub fn reduplicate_same_device() -> Result<Rebuilt> {
     let name = attach_input_desktop().unwrap_or_else(|e| {
         plog!("attach_input_desktop before reduplicate failed (continuing anyway): {e:?}");
@@ -92,9 +91,11 @@ pub fn reduplicate_same_device() -> Result<Rebuilt> {
         .ok_or_else(|| Error::from_hresult(windows::Win32::Foundation::E_FAIL))?;
 
     // See state::DUPLICATE_OUTPUT_LOCK: guarantees this can never overlap
-    // ddagrab's own initial DuplicateOutput(1) call (or, in principle,
-    // another recovery attempt, though only the single pump thread ever
-    // drives recovery today) into two live real duplication instances.
+    // ddagrab's own initial DuplicateOutput(1) call into two live real
+    // duplication instances. Recovery itself now always runs inline on
+    // ddagrab's own AcquireNextFrame-calling thread (no dedicated pump
+    // thread), so there is no other concurrent recovery attempt to worry
+    // about either -- this lock is kept for defense in depth regardless.
     let _guard = crate::state::DUPLICATE_OUTPUT_LOCK.lock();
 
     match source {
@@ -108,123 +109,6 @@ pub fn reduplicate_same_device() -> Result<Rebuilt> {
             plog!("reduplicate_same_device: succeeded via DuplicateOutput (same device)");
             Ok(Rebuilt { duplication: dup, source: DuplicationSource::V1 { output1, device } })
         }
-    }
-}
-
-/// Rebuilds the ENTIRE device -> IDXGIDevice -> IDXGIAdapter -> IDXGIOutput ->
-/// IDXGIOutputDuplication chain from scratch, starting from a brand new
-/// `D3D11CreateDevice` call, rather than reusing the previous chain's
-/// objects. Only used as a fallback when `reduplicate_same_device` itself
-/// fails (e.g. DXGI_ERROR_UNSUPPORTED after the device/output pairing itself
-/// has gone bad), since full re-creation was observed to be actively harmful
-/// as the FIRST recovery attempt (see `reduplicate_same_device` doc comment).
-pub fn recreate_from_scratch() -> Result<Rebuilt> {
-    let name = attach_input_desktop().unwrap_or_else(|e| {
-        plog!("attach_input_desktop before full rebuild failed (continuing anyway): {e:?}");
-        String::new()
-    });
-
-    // A prior version of this function skipped rebuilding while the input
-    // desktop was secure (Winlogon during a UAC prompt/lock screen), based
-    // on the `scrap` crate's recovery pattern (discard-and-recreate only
-    // after returning to normal). That was cross-checked against a minimal,
-    // standalone repro (`desktop-shot`, using the same win_desktop_duplication
-    // + attach-then-duplicate approach as this module) and disproven: with
-    // this thread re-attached to the input desktop BEFORE each rebuild
-    // (which the earlier attempts were also doing here), rebuilding WHILE on
-    // Winlogon succeeds immediately and produces a working duplication
-    // instance that captures the secure desktop itself (confirmed via saved
-    // frames showing the UAC consent dialog). The ~100 failed rebuild
-    // attempts observed earlier were not caused by rebuilding on a secure
-    // desktop per se; skipping the rebuild only meant capture stayed frozen
-    // for the entire UAC prompt and, in the reported regression, sometimes
-    // did not resume afterward either. So: always attempt the rebuild,
-    // regardless of which desktop is current.
-    plog!("input desktop is {name:?}; attempting full rebuild");
-
-    let args = crate::state::DEVICE_CREATE_ARGS
-        .lock()
-        .clone()
-        .ok_or_else(|| Error::from_hresult(windows::Win32::Foundation::E_FAIL))?;
-
-    // See state::DUPLICATE_OUTPUT_LOCK. Held across the whole rebuild, not
-    // just the final DuplicateOutput(1) call, since D3D11CreateDevice here
-    // and ddagrab's own initial call both ultimately feed into the same
-    // "how many live real duplication instances exist" invariant.
-    let _guard = crate::state::DUPLICATE_OUTPUT_LOCK.lock();
-
-    let output_idx = *crate::state::LAST_OUTPUT_INDEX.lock();
-
-    let device = create_device(&args)?;
-    let dxgi_device = query_interface::<IDXGIDevice>(Interface::as_raw(&device), call_original_query_interface)?;
-    let adapter = get_parent_adapter(&dxgi_device)?;
-    let output = enum_output(&adapter, output_idx)?;
-
-    // Prefer IDXGIOutput5::DuplicateOutput1 (matches ddagrab's own preference
-    // when available), falling back to IDXGIOutput1::DuplicateOutput.
-    if let Ok(output5) = query_interface::<IDXGIOutput5>(Interface::as_raw(&output), call_original_output_query_interface) {
-        let supported_formats = vec![windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM];
-        let dup = duplicate_output1(&output5, &device, 0, &supported_formats)?;
-        plog!("recreate_from_scratch: full rebuild succeeded via DuplicateOutput1");
-        return Ok(Rebuilt {
-            duplication: dup,
-            source: DuplicationSource::V5 { output5, device, flags: 0, supported_formats },
-        });
-    }
-
-    let output1 = query_interface::<IDXGIOutput1>(Interface::as_raw(&output), call_original_output_query_interface)?;
-    let dup = duplicate_output(&output1, &device)?;
-    plog!("recreate_from_scratch: full rebuild succeeded via DuplicateOutput");
-    Ok(Rebuilt { duplication: dup, source: DuplicationSource::V1 { output1, device } })
-}
-
-fn create_device(args: &DeviceCreateArgs) -> Result<ID3D11Device> {
-    unsafe {
-        let mut raw_device: *mut core::ffi::c_void = std::ptr::null_mut();
-        let feature_levels_ptr =
-            if args.feature_levels.is_empty() { std::ptr::null() } else { args.feature_levels.as_ptr() };
-
-        let hr = call_original_d3d11_create_device(
-            args.adapter,
-            args.driver_type,
-            args.software,
-            args.flags,
-            feature_levels_ptr,
-            args.feature_levels.len() as u32,
-            args.sdk_version,
-            &mut raw_device,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-        );
-        hr.ok()?;
-        Ok(Interface::from_raw(raw_device))
-    }
-}
-
-fn query_interface<T: Interface>(
-    this: *mut core::ffi::c_void,
-    call: unsafe fn(*mut core::ffi::c_void, *const GUID, *mut *mut core::ffi::c_void) -> windows::core::HRESULT,
-) -> Result<T> {
-    unsafe {
-        let mut raw: *mut core::ffi::c_void = std::ptr::null_mut();
-        call(this, &T::IID, &mut raw).ok()?;
-        Ok(Interface::from_raw(raw))
-    }
-}
-
-fn get_parent_adapter(device: &IDXGIDevice) -> Result<IDXGIAdapter> {
-    unsafe {
-        let mut raw: *mut core::ffi::c_void = std::ptr::null_mut();
-        call_original_get_parent(Interface::as_raw(device), &IDXGIAdapter::IID, &mut raw).ok()?;
-        Ok(Interface::from_raw(raw))
-    }
-}
-
-fn enum_output(adapter: &IDXGIAdapter, index: u32) -> Result<windows::Win32::Graphics::Dxgi::IDXGIOutput> {
-    unsafe {
-        let mut raw: *mut core::ffi::c_void = std::ptr::null_mut();
-        call_original_enum_outputs(Interface::as_raw(adapter), index, &mut raw).ok()?;
-        Ok(Interface::from_raw(raw))
     }
 }
 

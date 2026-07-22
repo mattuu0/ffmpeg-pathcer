@@ -1,11 +1,13 @@
 // ddagrab自身がDuplicateOutput/DuplicateOutput1で作るIDXGIOutputDuplicationを
-// vtableフックで乗っ取り(hooks::install_all)、専用のpumpスレッド(hooks::pump)に
-// 渡す。pumpは本物のAcquireNextFrame/ReleaseFrameを自分のペースで回し続け、
-// ACCESS_LOST等が起きたら「古いインスタンスを先にdropしてから再複製する」順序を
-// 守ってリカバリする(この順序がUAC/secure desktop遷移後も回復し続けるための鍵
-// だったことを検証済み)。取得した各フレームはGPU上でキャッシュにコピーされ、
-// ddagrab自身のAcquireNextFrame呼び出し(hooks::duplication_proxyのスタブ経由)
-// はそのキャッシュの最新世代を返すだけで、本物のインスタンスには二度と触れない。
+// vtableフックで乗っ取り(hooks::install_all)、hooks::duplication_proxyのラッパー
+// に渡す。ddagrab自身のAcquireNextFrame/ReleaseFrame呼び出しは、専用スレッドを
+// 挟まず本物のインスタンスへそのまま素通しする(常駐スレッドを持たせるとNVENC等
+// 下流のGPU処理と競合し、ddagrab側のフレーム要求頻度が時間とともに低下する現象を
+// 確認したため、素通し方式に変更した)。ACCESS_LOST等が起きた場合のみ、ddagrabの
+// 呼び出しスレッド上でその場で同期的にリカバリする -- 「古いインスタンスを先に
+// dropしてから再複製する」順序を守る点は変わらない(この順序がUAC/secure desktop
+// 遷移後も回復し続けるための鍵だったことを検証済み)。ddagrab自身はWAIT_TIMEOUT
+// かOkしか観測せず、ACCESS_LOST自体を見ることは無い。
 mod hooks;
 mod logging;
 mod recovery;

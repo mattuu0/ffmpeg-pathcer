@@ -48,6 +48,23 @@ fn main() -> Result<()> {
     println!("starting ffmpeg ({}) with ddagrab for {}s...", cli.ffmpeg_exe.display(), cli.duration_secs);
     let mut ffmpeg = spawn_ffmpeg(&cli.ffmpeg_exe, cli.duration_secs)?;
 
+    // ffmpeg's own stderr (progress line, and crucially any fatal error it
+    // prints right before exiting) was being piped but never read/shown --
+    // drain it on a background thread so an early/unexpected exit can
+    // actually be diagnosed instead of just showing "exited with status 0".
+    let stderr = ffmpeg.stderr.take().context("ffmpeg stderr was not piped")?;
+    std::thread::spawn(move || {
+        for line in BufReader::new(stderr).lines() {
+            match line {
+                Ok(line) => println!("[ffmpeg] {line}"),
+                Err(e) => {
+                    eprintln!("[ffmpeg] <stderr read error: {e}>");
+                    break;
+                }
+            }
+        }
+    });
+
     let start = Instant::now();
     let mut triggered = 0u32;
     let mut next_trigger_at = Duration::from_secs(cli.trigger_after_secs);

@@ -3,7 +3,6 @@ pub mod dxgi_adapter;
 pub mod dxgi_device;
 pub mod dxgi_output;
 pub mod duplication_proxy;
-pub mod pump;
 pub mod slots;
 pub mod vtable;
 

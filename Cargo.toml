@@ -9,4 +9,5 @@ members = [
     "poc/dda-probe",
     "poc/desktop-shot",
     "poc/capture-helper",
+    "poc/dummy-tcp-server",
 ]
