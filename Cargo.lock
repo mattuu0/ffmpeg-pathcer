@@ -316,15 +316,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "dda_hook_core"
+version = "0.1.0"
+dependencies = [
+ "once_cell",
+ "parking_lot",
+ "windows 0.62.2",
+ "windows-core 0.62.2",
+]
+
+[[package]]
 name = "ddagrab_proxy"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "export-scan",
- "once_cell",
- "parking_lot",
  "windows 0.62.2",
- "windows-core 0.62.2",
 ]
 
 [[package]]
@@ -882,6 +889,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "parsec-vdd-rust"
+version = "0.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b43afbe8e103bdfc6ebc646e87029a04a9025dd018861e64afe1d909d419132e"
+dependencies = [
+ "clap",
+ "windows 0.62.2",
+]
+
+[[package]]
 name = "pbkdf2"
 version = "0.12.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1343,6 +1360,16 @@ name = "utf8parse"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
+
+[[package]]
+name = "vdd-helper"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "parsec-vdd-rust",
+ "windows 0.62.2",
+]
 
 [[package]]
 name = "version_check"

@@ -65,9 +65,15 @@ disclaimer.**
 
 ## 構成 / Structure
 
-- `proxy/` — 本体。`avfilter-12.dll` の全 export をフォワーディングしつつ、
-  DXGI の Desktop Duplication 呼び出しだけをフックしてリカバリ処理を行う
-  プロキシ DLL。
+- `dda-hook-core/` — フック本体。DXGI/D3D11 の Desktop Duplication 呼び出し
+  をフックしてリカバリ処理を行う、FFmpeg/ddagrab に依存しない汎用 DLL。この
+  DLL がプロセスにロードされるだけ（`DllMain` の `DLL_PROCESS_ATTACH`）で
+  パッチが完了する。
+- `proxy/` — `avfilter-12.dll` の全 export をフォワーディングしつつ、ロード
+  時に `dda-hook-core` を `LoadLibrary` するだけの薄い「なりすまし」DLL。
+  フック実装は一切持たない。他のソフトウェアに応用する場合は、この crate と
+  同じパターン（対象アプリが読み込む DLL 名を模倣する export forwarding
+  shim）を作れば `dda-hook-core` をそのまま再利用できる。
 - `export-scan/` — DLL の named export 一覧を読み取るためのライブラリ
   （`proxy/build.rs` が .def ファイル生成に使用）。
 - `xtask/` — `export-scan` の動作確認用 CLI（開発補助ツール）。
@@ -76,9 +82,16 @@ disclaimer.**
   なった実験や、別方式との比較検証のために残してあります。詳細は
   [`poc/README.md`](poc/README.md) を参照してください。
 
-- `proxy/` — The main crate: the proxy DLL that forwards every export of
-  `avfilter-12.dll` unchanged while hooking only the DXGI Desktop
-  Duplication calls to perform recovery.
+- `dda-hook-core/` — The hook implementation itself: a generic DLL (no
+  FFmpeg/ddagrab dependency) that hooks DXGI/D3D11 Desktop Duplication calls
+  and performs recovery. Simply loading this DLL into a process (its
+  `DllMain`'s `DLL_PROCESS_ATTACH`) completes the patch.
+- `proxy/` — A thin "impersonation" DLL that forwards every export of
+  `avfilter-12.dll` unchanged, and on load just `LoadLibrary`s
+  `dda-hook-core` -- it holds no hook logic of its own. To target a
+  different piece of software, write a new shim following this same pattern
+  (an export-forwarding DLL impersonating whatever DLL that software loads)
+  and it can reuse `dda-hook-core` as-is.
 - `export-scan/` — Library that reads a DLL's named exports (used by
   `proxy/build.rs` to generate its `.def` file).
 - `xtask/` — CLI wrapper around `export-scan` for manual inspection (dev

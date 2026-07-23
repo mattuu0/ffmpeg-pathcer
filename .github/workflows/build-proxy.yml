@@ -156,17 +156,22 @@ jobs:
           Write-Host "using lib.exe: $($libExe.FullName)"
           echo "path=$($libExe.FullName)" >> $env:GITHUB_OUTPUT
 
-      - name: Build proxy DLL
+      # Builds both DLLs: dda_hook_core.dll (the actual hook/recovery
+      # implementation) and ddagrab_proxy.dll (the thin avfilter-impersonating
+      # shim that just LoadLibrary's the former on attach). Both must ship
+      # together -- the proxy alone does nothing without the core DLL beside
+      # it.
+      - name: Build proxy + hook-core DLLs
         env:
           DDAGRAB_REAL_AVFILTER_DLL: ${{ steps.fetch.outputs.real_dll_path }}
           DDAGRAB_LIB_EXE: ${{ steps.libexe.outputs.path }}
-        run: cargo build --release -p ddagrab_proxy --target ${{ matrix.rust_target }}
+        run: cargo build --release -p ddagrab_proxy -p dda_hook_core --target ${{ matrix.rust_target }}
 
-      # Assembles the actual distributable: the DLL, its SHA256 (so users can
-      # verify the download wasn't corrupted/tampered with), and the
-      # disclaimer-bearing README -- all three always travel together, never
-      # the bare DLL alone.
-      - name: Stage package (DLL + SHA256SUMS.txt + README.md)
+      # Assembles the actual distributable: both DLLs, their SHA256 (so users
+      # can verify the download wasn't corrupted/tampered with), and the
+      # disclaimer-bearing README -- all travel together, never the bare
+      # proxy DLL alone.
+      - name: Stage package (DLLs + SHA256SUMS.txt + README.md)
         shell: pwsh
         run: |
           $sonameStem = "${{ steps.fetch.outputs.soname_stem }}"
@@ -175,10 +180,15 @@ jobs:
 
           $dllName = "$sonameStem.dll"
           Copy-Item "target/${{ matrix.rust_target }}/release/ddagrab_proxy.dll" "$pkgDir/$dllName"
+          Copy-Item "target/${{ matrix.rust_target }}/release/dda_hook_core.dll" "$pkgDir/dda_hook_core.dll"
           Copy-Item "output/README.md" "$pkgDir/README.md"
 
           $hash = (Get-FileHash "$pkgDir/$dllName" -Algorithm SHA256).Hash.ToLower()
-          "$hash *$dllName" | Out-File -FilePath "$pkgDir/SHA256SUMS.txt" -Encoding ascii -NoNewline
+          $coreHash = (Get-FileHash "$pkgDir/dda_hook_core.dll" -Algorithm SHA256).Hash.ToLower()
+          @(
+            "$hash *$dllName"
+            "$coreHash *dda_hook_core.dll"
+          ) -join "`n" | Out-File -FilePath "$pkgDir/SHA256SUMS.txt" -Encoding ascii -NoNewline
 
           $zipName = "ddagrab-proxy-${{ needs.check.outputs.release_tag }}-${{ matrix.arch }}.zip"
           Compress-Archive -Path "$pkgDir/*" -DestinationPath "package/$zipName"

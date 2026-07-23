@@ -87,16 +87,20 @@ so ddagrab itself only ever sees "no new frame yet". Mouse cursor rendering
 
 ## インストール方法 / Installation
 
-1. `ddagrab_proxy.dll` を、使っている FFmpeg 配布物の `bin/avfilter-12.dll`
-   と同じフォルダに置きます。
+1. `ddagrab_proxy.dll` と `dda_hook_core.dll` を、使っている FFmpeg 配布物の
+   `bin/avfilter-12.dll` と同じフォルダに置きます（両方必要です — フック本体
+   は `dda_hook_core.dll` 側にあり、`ddagrab_proxy.dll` はロード時にそれを
+   読み込むだけです）。
 2. **本物の `avfilter-12.dll` を `avfilter-12_orig.dll` にリネーム**します
    （このプロキシは実体の DLL を全 export フォワーディングで包んでいるだけ
    なので、本物がこの名前で存在しないと起動時に失敗します）。
 3. `ddagrab_proxy.dll` を `avfilter-12.dll` という名前でコピー（またはリネ
    ーム）して配置します。
 
-1. Place `ddagrab_proxy.dll` in the same folder as your FFmpeg build's
-   `bin/avfilter-12.dll`.
+1. Place both `ddagrab_proxy.dll` and `dda_hook_core.dll` in the same folder
+   as your FFmpeg build's `bin/avfilter-12.dll` (both are required — the hook
+   implementation lives in `dda_hook_core.dll`; `ddagrab_proxy.dll` just loads
+   it on attach).
 2. **Rename the real `avfilter-12.dll` to `avfilter-12_orig.dll`** (the proxy
    forwards every export to the DLL under that exact name, so it will fail
    to load if the real one isn't there).
@@ -104,10 +108,10 @@ so ddagrab itself only ever sees "no new frame yet". Mouse cursor rendering
 
 ## アンインストール方法 / Uninstallation
 
-1. `bin/avfilter-12.dll`（プロキシ）を削除。
+1. `bin/avfilter-12.dll`（プロキシ）と `bin/dda_hook_core.dll` を削除。
 2. `bin/avfilter-12_orig.dll` を `avfilter-12.dll` にリネームし直す。
 
-1. Delete `bin/avfilter-12.dll` (the proxy).
+1. Delete `bin/avfilter-12.dll` (the proxy) and `bin/dda_hook_core.dll`.
 2. Rename `bin/avfilter-12_orig.dll` back to `avfilter-12.dll`.
 
 ## 使い方 / Usage
@@ -151,17 +155,19 @@ not match, the file may be corrupted or tampered with -- do not use it.
 
 ## ログ / Logging
 
-同じフォルダに `ddagrab_proxy.log` が生成され、フック状況・UAC/secure desktop
-遷移の検知・復旧の成否などが追記されていきます。問題が起きた場合はまずこの
-ログの末尾（`ddagrab_proxy loaded` 以降の一番新しい実行分）を確認してくださ
-い。ログは起動のたびに追記されるだけで自動ローテートはされないため、肥大化
-が気になる場合は適宜削除してください。
+同じフォルダに `ddagrab_proxy.log`（プロキシ自身のロード状況）と
+`dda_hook_core.log`（フック状況・UAC/secure desktop 遷移の検知・復旧の成否
+など）の 2 つが生成されます。問題が起きた場合はまず後者の末尾（`dda_hook_core
+loaded` 以降の一番新しい実行分）を確認してください。どちらも起動のたびに
+追記されるだけで自動ローテートはされないため、肥大化が気になる場合は適宜
+削除してください。
 
-`ddagrab_proxy.log` is created in the same folder and appended to on every
-run, recording hook installation, desktop transitions, and recovery
-success/failure. If something goes wrong, check the tail of the log (after
-the most recent `ddagrab_proxy loaded` line) first. The log is never
-rotated automatically -- delete it yourself if it grows too large.
+Two log files are created in the same folder: `ddagrab_proxy.log` (the
+proxy's own load status) and `dda_hook_core.log` (hook installation, desktop
+transitions, and recovery success/failure). If something goes wrong, check
+the tail of the latter (after the most recent `dda_hook_core loaded` line)
+first. Neither is rotated automatically -- delete them yourself if they grow
+too large.
 
 ## 制限事項・注意点 / Limitations
 
