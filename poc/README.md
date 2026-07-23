@@ -121,3 +121,12 @@ RTSP サーバーが別マシン、または既定と異なるポートで動い
 しているターミナルで Ctrl+C を押してください（`--system` 利用時も、PAExec
 経由で起動した SYSTEM 権限の ffmpeg プロセスまで含めて後始末します）。
 DLL の配置は `verify_matrix.py` と同様に自動退避・復元されます。
+
+## latency-poc / android-viewer — RTSPサーバー無しの低遅延ストリーミングPOC
+
+`poc/latency-poc`（Windows側: ddagrab + h264_nvenc + RTP/UDP直接送信）と
+`poc/android-viewer`（Android TV / Fire TV側: 自前RTPデパケタイズ +
+MediaCodecハードウェアデコード + 遅延計測オーバーレイ）は、別途RTSP
+サーバーを用意せずに、Windowsから直接Android端末へ映像を送るための
+POCです。詳細は [poc/latency-poc/README.md](latency-poc/README.md) を
+参照してください。
