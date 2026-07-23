@@ -335,7 +335,31 @@ impl IDXGIOutputDuplication_Impl for DuplicationProxy_Impl {
         // returns a failure HRESULT that ddagrab treats as fatal.
         let owner = self.locked_frame_owner.lock().take();
         match owner {
-            Some(real) => unsafe { real.ReleaseFrame() },
+            Some(real) => {
+                let result = unsafe { real.ReleaseFrame() };
+                if let Err(e) = &result {
+                    // ddagrab treats ANY ReleaseFrame failure as fatal
+                    // (AVERROR_EXTERNAL, "DDA ReleaseFrame failed!") with no
+                    // recovery of its own -- unlike AcquireNextFrame, which
+                    // this proxy already recovers from inline above. A
+                    // failure here overwhelmingly means the owning instance
+                    // itself has already gone bad (e.g. the same
+                    // ACCESS_LOST/torn-down-display condition recovery
+                    // exists to handle, just observed on this call instead of
+                    // the next AcquireNextFrame), so the instance is being
+                    // discarded either way. Swallowing it here keeps this
+                    // failure mode symmetric with AcquireNextFrame's: ddagrab
+                    // must never observe a HRESULT from this proxy that it
+                    // cannot itself recover from.
+                    plog!(
+                        "[DuplicationProxy::ReleaseFrame] failed on locked owner (hr={:?}); \
+                         swallowing since ddagrab treats any failure here as fatal",
+                        e.code()
+                    );
+                    return Ok(());
+                }
+                result
+            }
             None => Ok(()),
         }
     }
