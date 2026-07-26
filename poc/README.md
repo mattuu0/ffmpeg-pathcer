@@ -9,7 +9,8 @@
   実際にどう失敗するか、どう復旧させれば効果があるか（何もしない /
   再アタッチのみ / 同じ device で再複製 / device から丸ごと再構築）を
   戦略ごとに比較するために作った。ここで得た知見（"古いインスタンスを
-  drop してから再複製する"順序が必須、等）が `proxy/src/hooks/pump.rs` の
+  drop してから再複製する"順序が必須、等）が
+  [`dda-hook-core/src/recovery.rs`](../dda-hook-core/src/recovery.rs) の
   実装に反映されている。
 
 - **desktop-shot** — `win_desktop_duplication` クレートを使い、secure

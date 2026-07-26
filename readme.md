@@ -104,23 +104,119 @@ disclaimer.**
 ## 動作原理の要点 / How it works
 
 - ddagrab 自身が呼ぶ `DuplicateOutput`/`DuplicateOutput1` をフックし、
-  本物の `IDXGIOutputDuplication` を裏側の専用スレッド（pump）に渡します。
-- pump スレッドは本物のインスタンスを自分のペースでポーリングし続け、
-  UAC 遷移などで `ACCESS_LOST` になった場合は「古いインスタンスを先に
-  drop してから再生成する」順序を守って復旧します。
-- ddagrab 自身が呼ぶ `AcquireNextFrame` は、pump が GPU 上にキャッシュした
-  最新フレームを返すダミーの `IDXGIOutputDuplication` 実装（プロキシ）
-  から返されるため、ddagrab 側からは常に「フレームがまだ来ていないだけ」
-  にしか見えず、復旧処理そのものを意識しません。
+  本物の `IDXGIOutputDuplication` をダミーの実装（`DuplicationProxy`）で
+  ラップして差し替えます。**専用のバックグラウンドスレッド（pump）は
+  存在しません** — `AcquireNextFrame` は ddagrab 自身が呼んだその場で、
+  同期的に本物のインスタンスへストレートに委譲します。
+- 以前のバージョンは本物のインスタンスを裏側の専用スレッドで独自にポーリ
+  ングし続ける設計（pump）でしたが、`hevc_nvenc` 等のエンコーダを繋いだ
+  ときに ddagrab 自身のフレーム要求レートが 60Hz から 1〜2Hz まで落ち込む
+  現象が確認され、原因が「同じ `ID3D11Device`/`ImmediateContext` に触る
+  スレッドがもう1本存在すること自体」（pump が何をしているかではなく、
+  存在することそのもの）にあると特定されたため撤去されました。詳細は
+  [`dda-hook-core/src/hooks/duplication_proxy.rs`](dda-hook-core/src/hooks/duplication_proxy.rs)
+  のモジュールコメントを参照してください。
+- `ACCESS_LOST`/`ACCESS_DENIED`/`INVALID_CALL` を検知した場合は、
+  `AcquireNextFrame` を呼んだそのスレッド上で同期的に復旧します。「古い
+  インスタンスを先に drop してから再生成する」順序を守る必要があり
+  （[`dda-hook-core/src/recovery.rs`](dda-hook-core/src/recovery.rs)）、
+  復旧が完了するまでの間 ddagrab には `WAIT_TIMEOUT` だけを返すため、
+  ddagrab 側からは常に「フレームがまだ来ていないだけ」にしか見えず、
+  復旧処理そのものを意識しません。
 
 - ddagrab's own calls to `DuplicateOutput`/`DuplicateOutput1` are hooked, and
-  the real `IDXGIOutputDuplication` is handed off to a dedicated background
-  thread ("pump").
-- The pump thread polls the real instance at its own pace, and on
-  `ACCESS_LOST` (e.g. during a UAC transition) recovers by dropping the dead
-  instance FIRST, then re-duplicating -- that ordering turned out to be
-  required for recovery to actually work.
-- ddagrab's own `AcquireNextFrame` calls are served by a stub
-  `IDXGIOutputDuplication` implementation that returns whatever frame the
-  pump most recently cached on the GPU, so ddagrab itself only ever sees
-  "no new frame yet" and never has to know recovery is happening at all.
+  the real `IDXGIOutputDuplication` is wrapped by a stub implementation
+  (`DuplicationProxy`). **There is no dedicated background "pump" thread** --
+  `AcquireNextFrame` is a straight, synchronous passthrough to the real
+  instance, called on whatever thread ddagrab itself calls from.
+- An earlier version DID have a dedicated background thread polling the real
+  instance independently (a "pump"). It was removed after diagnostics showed
+  ddagrab's own frame-request rate dropping from 60Hz to as low as 1-2Hz once
+  an encoder (`hevc_nvenc`) was downstream -- traced to the mere existence of
+  a second thread continuously touching the same `ID3D11Device`/
+  `ImmediateContext` ddagrab and NVENC also share (not anything the pump was
+  doing per frame). See the module doc comment in
+  [`dda-hook-core/src/hooks/duplication_proxy.rs`](dda-hook-core/src/hooks/duplication_proxy.rs)
+  for the full story.
+- On `ACCESS_LOST`/`ACCESS_DENIED`/`INVALID_CALL`, recovery runs inline, on
+  that same calling thread: drop the dead instance FIRST, then re-duplicate
+  -- that ordering turned out to be required for recovery to actually work
+  ([`dda-hook-core/src/recovery.rs`](dda-hook-core/src/recovery.rs)). ddagrab
+  only ever observes `WAIT_TIMEOUT` while this is in progress, so it only
+  ever sees "no new frame yet" and never has to know recovery is happening
+  at all.
+
+## 他アプリとの互換性 / Compatibility with other applications
+
+`dda-hook-core` は ddagrab や FFmpeg の関数・シンボルには一切依存していませ
+ん。フックの起点は `d3d11.dll` がエクスポートするグローバル関数
+`D3D11CreateDevice` へのインラインフック1つだけで（
+[`dda-hook-core/src/hooks/d3d11_device.rs`](dda-hook-core/src/hooks/d3d11_device.rs)）、
+そこから
+
+`D3D11CreateDevice` → `QueryInterface`(`IDXGIDevice`) → `GetParent`(`IDXGIAdapter`)
+→ `EnumOutputs`(`IDXGIOutput`) → `DuplicateOutput`/`DuplicateOutput1`
+→ `AcquireNextFrame`
+
+という COM vtable の連鎖を、実際にそのプロセスが呼び出した順に**動的に**追跡
+してフックを仕込みます（`hooks::install_all()` が eager にインストールする
+のは `D3D11CreateDevice` だけで、残りは初めて観測した時点で遅延インストール
+されます — [`dda-hook-core/src/hooks/mod.rs`](dda-hook-core/src/hooks/mod.rs)）。
+ffmpeg 固有の呼び出し規約や `vsrc_ddagrab.c` の内部実装に依存する処理は一切
+ありません。
+
+これはつまり、**Desktop Duplication API (`IDXGIOutputDuplication`) を
+`D3D11CreateDevice` 経由で使うアプリケーションであれば、ffmpeg 以外でも
+理論上そのまま動作するということです。** フックしている対象が
+
+- `D3D11CreateDevice`（`d3d11.dll` の通常のエクスポート、静的インポートでも
+  `LoadLibrary`+`GetProcAddress` 経由でも同じコードバイトを通るため区別なく
+  捕捉できる）
+- DXGI/D3D11 の COM vtable スロット（`IDXGIDevice`/`IDXGIAdapter`/
+  `IDXGIOutput`/`IDXGIOutputDuplication` 系。Windows 側で ABI が固定されて
+  いる公開インターフェース）
+
+のみであり、呼び出し元アプリケーションの実装（OBS、ブラウザの画面共有、
+独自のキャプチャツールなど）を一切問わないためです。
+
+ただし実際に別アプリへ組み込むには、`proxy/` が行っているのと同じ手法
+（対象アプリが読み込む DLL の全 export を forward しつつロード時に
+`dda-hook-core` を `LoadLibrary` する、なりすまし DLL）を、対象アプリが
+実際に読み込む DLL 名に合わせて別途用意する必要があります。`dda-hook-core`
+自体はそのまま流用でき、ソースの変更は不要です。
+
+- `dda-hook-core` has zero dependency on ddagrab or FFmpeg symbols. The only
+  eagerly-installed hook is a single inline hook on the global function
+  `D3D11CreateDevice` exported by `d3d11.dll`
+  ([`dda-hook-core/src/hooks/d3d11_device.rs`](dda-hook-core/src/hooks/d3d11_device.rs)),
+  from which it **dynamically** tracks the COM vtable chain
+
+  `D3D11CreateDevice` → `QueryInterface`(`IDXGIDevice`) → `GetParent`(`IDXGIAdapter`)
+  → `EnumOutputs`(`IDXGIOutput`) → `DuplicateOutput`/`DuplicateOutput1`
+  → `AcquireNextFrame`
+
+  in whatever order the host process actually calls it, lazily installing
+  each downstream hook the first time that object is observed
+  ([`dda-hook-core/src/hooks/mod.rs`](dda-hook-core/src/hooks/mod.rs)). None
+  of this depends on ffmpeg's calling conventions or `vsrc_ddagrab.c`'s
+  internals.
+
+  In other words: **any application that uses the Desktop Duplication API
+  (`IDXGIOutputDuplication`) via `D3D11CreateDevice` should theoretically work
+  with this hook, not just ffmpeg.** The only things being hooked are
+
+  - `D3D11CreateDevice` (an ordinary `d3d11.dll` export -- caught the same way
+    whether the caller resolved it via static import or
+    `LoadLibrary`+`GetProcAddress`, since both end up executing the same code
+    bytes)
+  - DXGI/D3D11 COM vtable slots (`IDXGIDevice`/`IDXGIAdapter`/`IDXGIOutput`/
+    `IDXGIOutputDuplication` -- public interfaces with a stable Windows ABI)
+
+  none of which care about the calling application's own implementation (OBS,
+  a browser's screen-share, a custom capture tool, etc.).
+
+  To actually deploy this against a different application, though, you'd need
+  a new shim DLL following the same pattern `proxy/` uses (forward every
+  export of whatever DLL that application loads, and `LoadLibrary` this
+  `dda-hook-core` on attach), targeting that application's actual DLL name.
+  `dda-hook-core` itself can be reused as-is, with no source changes.
