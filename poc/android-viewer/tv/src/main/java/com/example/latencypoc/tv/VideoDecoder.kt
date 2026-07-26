@@ -3,10 +3,13 @@ package com.example.latencypoc.tv
 import android.media.MediaCodec
 import android.media.MediaCodecInfo
 import android.media.MediaFormat
+import android.os.Handler
+import android.os.HandlerThread
 import android.util.Log
 import android.view.Surface
 import java.io.ByteArrayOutputStream
 import java.nio.ByteBuffer
+import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
 
@@ -39,6 +42,17 @@ private const val TAG = "VideoDecoder"
  * POC). A fixed default is used for `MediaFormat`'s initial width/height
  * instead; `MediaCodec` renders at the stream's actual resolution
  * regardless once csd-0/1/2 are parsed internally.
+ *
+ * Uses `MediaCodec.Callback` (async mode) rather than polling
+ * dequeueInputBuffer/dequeueOutputBuffer synchronously -- the earlier
+ * polling version only ever checked for an available output buffer once,
+ * immediately after submitting input, capped at a 10ms wait for an input
+ * buffer to free up. That undercounts decode latency (a buffer produced
+ * slightly later than that one check was never observed) and, on a
+ * loaded system, can leave the feeder thread blocked waiting on
+ * dequeueInputBuffer instead of picking up the next already-parsed NAL.
+ * The callback fires exactly when a buffer is actually ready either way,
+ * so neither issue applies here.
  */
 class VideoDecoder(
     private val surface: Surface,
@@ -71,9 +85,33 @@ class VideoDecoder(
     private val accessUnit = ByteArrayOutputStream()
     private var accessUnitHasSlice = false
 
+    // Access units waiting for a free input buffer, and free input buffer
+    // indices waiting for an access unit -- whichever arrives second (a NAL
+    // finishing an access unit, or onInputBufferAvailable firing) drains the
+    // other queue immediately. Neither queue is ever left holding a buffer
+    // index without eventually feeding it back to MediaCodec: every index
+    // that comes in via onInputBufferAvailable is either used right away
+    // (an access unit was already waiting) or parked here until one shows
+    // up, so no input buffer is ever silently dropped. A narrow race
+    // (both queues briefly empty from each side's point of view, so both
+    // just park instead of one immediately consuming the other) is possible
+    // between this and the feeder thread, but self-resolves on the very
+    // next event from either side -- not worth a lock for a POC.
+    private val readyAccessUnits = ConcurrentLinkedQueue<PendingUnit>()
+    private val freeInputBufferIndices = ConcurrentLinkedQueue<Int>()
+    private data class PendingUnit(val bytes: ByteArray, val submitNanos: Long = System.nanoTime())
+
+    // The callback thread's own submitNanos bookkeeping, keyed by the
+    // presentationTimeUs each queued buffer was given -- MediaCodec's
+    // onOutputBufferAvailable only hands back a BufferInfo (which carries
+    // that timestamp), not the input index it came from, so this is how
+    // decode latency gets matched back to when its input was submitted.
+    private val submitTimestamps = java.util.concurrent.ConcurrentHashMap<Long, Long>()
+
     private val pendingUnits = LinkedBlockingQueue<ByteArray>()
     @Volatile private var running = false
     private var feederThread: Thread? = null
+    private var callbackHandlerThread: HandlerThread? = null
 
     fun start() {
         running = true
@@ -128,6 +166,11 @@ class VideoDecoder(
         firstFrameSeen = false
         accessUnit.reset()
         accessUnitHasSlice = false
+        readyAccessUnits.clear()
+        freeInputBufferIndices.clear()
+        submitTimestamps.clear()
+        callbackHandlerThread?.quitSafely()
+        callbackHandlerThread = null
     }
 
     private fun feedLoop() {
@@ -257,12 +300,52 @@ class VideoDecoder(
 
     private fun startCodec(mimeType: String, format: MediaFormat) {
         try {
+            val handlerThread = HandlerThread("decoder-callback").apply { start() }
+            callbackHandlerThread = handlerThread
+            val handler = Handler(handlerThread.looper)
+
             val mc = MediaCodec.createDecoderByType(mimeType)
+            mc.setCallback(object : MediaCodec.Callback() {
+                override fun onInputBufferAvailable(codec: MediaCodec, index: Int) {
+                    val pending = readyAccessUnits.poll()
+                    if (pending == null) {
+                        // No access unit ready yet -- park this buffer index
+                        // rather than dropping it; submitToCodec() below
+                        // picks it back up the moment one arrives.
+                        freeInputBufferIndices.offer(index)
+                        return
+                    }
+                    submitToInputBuffer(codec, index, pending)
+                }
+
+                override fun onOutputBufferAvailable(codec: MediaCodec, index: Int, info: MediaCodec.BufferInfo) {
+                    val submitNanos = submitTimestamps.remove(info.presentationTimeUs)
+                    if (submitNanos != null) {
+                        stats.lastDecodeLatencyMs = (System.nanoTime() - submitNanos) / 1_000_000.0
+                    }
+                    stats.framesDecoded.incrementAndGet()
+                    codec.releaseOutputBuffer(index, true) // true = render to the Surface immediately
+                    stats.framesRendered.incrementAndGet()
+
+                    if (!firstFrameSeen) {
+                        firstFrameSeen = true
+                        onFirstFrameDecoded()
+                    }
+                }
+
+                override fun onError(codec: MediaCodec, e: MediaCodec.CodecException) {
+                    Log.w(TAG, "codec error", e)
+                }
+
+                override fun onOutputFormatChanged(codec: MediaCodec, format: MediaFormat) {
+                    Log.i(TAG, "output format changed: $format")
+                }
+            }, handler)
             mc.configure(format, surface, null, 0)
             mc.start()
             codec = mc
             configured = true
-            Log.i(TAG, "$mimeType decoder configured")
+            Log.i(TAG, "$mimeType decoder configured (async)")
         } catch (e: Exception) {
             Log.e(TAG, "Failed to configure decoder for $mimeType", e)
         }
@@ -276,47 +359,39 @@ class VideoDecoder(
         accessUnitHasSlice = false
     }
 
+    /**
+     * Runs on the feeder thread. If a buffer index is already waiting (from
+     * a previous onInputBufferAvailable that found nothing ready), submits
+     * immediately; otherwise just queues the access unit for the next
+     * callback to pick up.
+     */
     private fun submitToCodec(accessUnitBytes: ByteArray) {
         val mc = codec ?: return
-        val submitNanos = System.nanoTime()
+        val freeIndex = freeInputBufferIndices.poll()
+        if (freeIndex != null) {
+            submitToInputBuffer(mc, freeIndex, PendingUnit(accessUnitBytes))
+        } else {
+            readyAccessUnits.offer(PendingUnit(accessUnitBytes))
+        }
+    }
+
+    /** Runs on the callback (HandlerThread) thread, invoked from onInputBufferAvailable. */
+    private fun submitToInputBuffer(mc: MediaCodec, index: Int, pending: PendingUnit) {
         try {
-            val inputIndex = mc.dequeueInputBuffer(10_000)
-            if (inputIndex < 0) return
-            val inputBuffer = mc.getInputBuffer(inputIndex) ?: return
+            val inputBuffer = mc.getInputBuffer(index) ?: return
             inputBuffer.clear()
-            inputBuffer.put(accessUnitBytes)
+            inputBuffer.put(pending.bytes)
             // presentationTimeUs just needs to be monotonically non-decreasing
             // for the codec's own reordering -- there's no timestamp at all
             // on this raw TCP connection, so a simple wall-clock-derived
             // counter is used instead. Absolute value doesn't matter for a
-            // live, non-seekable stream like this.
-            val ptsUs = submitNanos / 1000L
-            mc.queueInputBuffer(inputIndex, 0, accessUnitBytes.size, ptsUs, 0)
-
-            drainOutput(submitNanos)
+            // live, non-seekable stream like this. Also doubles as the key
+            // onOutputBufferAvailable uses to look submitNanos back up.
+            val ptsUs = pending.submitNanos / 1000L
+            submitTimestamps[ptsUs] = pending.submitNanos
+            mc.queueInputBuffer(index, 0, pending.bytes.size, ptsUs, 0)
         } catch (e: Exception) {
-            Log.w(TAG, "codec submit/drain error", e)
-        }
-    }
-
-    private fun drainOutput(submitNanos: Long) {
-        val mc = codec ?: return
-        val info = MediaCodec.BufferInfo()
-        while (true) {
-            val outputIndex = mc.dequeueOutputBuffer(info, 0)
-            if (outputIndex < 0) break
-
-            val decodeLatencyMs = (System.nanoTime() - submitNanos) / 1_000_000.0
-            stats.lastDecodeLatencyMs = decodeLatencyMs
-            stats.framesDecoded.incrementAndGet()
-
-            mc.releaseOutputBuffer(outputIndex, true) // true = render to the Surface immediately
-            stats.framesRendered.incrementAndGet()
-
-            if (!firstFrameSeen) {
-                firstFrameSeen = true
-                onFirstFrameDecoded()
-            }
+            Log.w(TAG, "codec submit error", e)
         }
     }
 

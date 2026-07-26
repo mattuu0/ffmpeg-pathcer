@@ -19,3 +19,9 @@ poc/*.out
 # not source.
 /ddagrab_proxy.log
 /Users*ffmpeg-level*
+
+# PsExec/PAExec -- fetched locally per-machine to relaunch ffmpeg.exe as
+# SYSTEM (see send_stream.py's --psexec-path / --no-system-relaunch), not
+# something this repo redistributes.
+poc/latency-poc/windows-sender/paexec.exe
+poc/latency-poc/windows-sender/PsExec*.exe

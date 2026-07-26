@@ -99,12 +99,21 @@ class TcpReceiver(
 
     private fun handleConnection(socket: Socket) {
         socket.tcpNoDelay = true
-        val reader = AnnexBNalReader(socket.getInputStream())
+        val splitter = AnnexBNalSplitter()
+        val input = socket.getInputStream()
+        val readBuf = ByteArray(64 * 1024)
         while (running.get()) {
-            val nal = reader.readNextNal() ?: break
+            val n = try {
+                input.read(readBuf)
+            } catch (e: Exception) {
+                break
+            }
+            if (n < 0) break
             val arrivalNanos = System.nanoTime()
-            stats.onNalArrival(arrivalNanos, nal.size)
-            onNal(nal)
+            for (nal in splitter.push(readBuf.copyOf(n))) {
+                stats.onNalArrival(arrivalNanos, nal.size)
+                onNal(nal)
+            }
         }
         try {
             socket.close()

@@ -31,13 +31,22 @@ import androidx.lifecycle.lifecycleScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
-/** TCP port the Windows sender connects to. Fixed for this POC -- see poc/latency-poc README. */
-private const val LISTEN_PORT = 5000
+/** WebSocket port tcp-ws-relay connects to. Fixed for this POC -- see poc/latency-poc README. */
+private const val LISTEN_PORT = 5001
 private const val STATS_REFRESH_MS = 500L
 
+/**
+ * WebSocket-server receiver: listens (server role) on [LISTEN_PORT] for
+ * tcp-ws-relay to connect to (see poc/latency-poc/tcp-ws-relay), same
+ * topology as the original direct-TCP path -- Android listens and
+ * advertises itself via mDNS/NSD, and the other side (now the relay,
+ * rather than ffmpeg directly) connects in. ffmpeg still only ever speaks
+ * plain TCP, to the relay; the relay is what bridges that to a WebSocket
+ * *client* connection out to this listener.
+ */
 class MainActivity : ComponentActivity() {
     private val stats = StreamStats()
-    private var receiver: TcpReceiver? = null
+    private var wsServer: WebSocketServer? = null
     private var decoder: VideoDecoder? = null
     private lateinit var nsdAdvertiser: NsdAdvertiser
 
@@ -58,6 +67,7 @@ class MainActivity : ComponentActivity() {
                 Box(modifier = Modifier.fillMaxSize().background(Color.Black)) {
                     ViewerScreen(
                         stats = stats,
+                        waitingLabel = "WEBSOCKET $LISTEN_PORT",
                         onSurfaceReady = { surface -> startPipeline(surface) },
                         onSurfaceDestroyed = { stopPipeline() },
                     )
@@ -96,25 +106,25 @@ class MainActivity : ComponentActivity() {
         dec.start()
         decoder = dec
 
-        val recv = TcpReceiver(
+        val server = WebSocketServer(
             LISTEN_PORT,
             onNewConnection = { decoder?.onNewConnection() },
             onNal = { nal -> decoder?.onNal(nal) },
             stats = stats,
         )
-        recv.start()
-        receiver = recv
+        server.start()
+        wsServer = server
 
         // Advertised only once the socket is actually bound and listening --
-        // otherwise the Windows sender could discover this device via mDNS
-        // and try to connect before TcpReceiver.start() has bound the port.
+        // otherwise tcp-ws-relay could discover this device via mDNS and
+        // try to connect before WebSocketServer.start() has bound the port.
         nsdAdvertiser.start(LISTEN_PORT)
     }
 
     private fun stopPipeline() {
         nsdAdvertiser.stop()
-        receiver?.stop()
-        receiver = null
+        wsServer?.stop()
+        wsServer = null
         decoder?.stop()
         decoder = null
     }
@@ -128,6 +138,7 @@ class MainActivity : ComponentActivity() {
 @Composable
 private fun ViewerScreen(
     stats: StreamStats,
+    waitingLabel: String,
     onSurfaceReady: (Surface) -> Unit,
     onSurfaceDestroyed: () -> Unit,
 ) {
@@ -149,14 +160,14 @@ private fun ViewerScreen(
             },
         )
 
-        StatsOverlay(stats = stats, modifier = Modifier
+        StatsOverlay(stats = stats, waitingLabel = waitingLabel, modifier = Modifier
             .align(Alignment.TopStart)
             .padding(24.dp))
     }
 }
 
 @Composable
-private fun StatsOverlay(stats: StreamStats, modifier: Modifier = Modifier) {
+private fun StatsOverlay(stats: StreamStats, waitingLabel: String, modifier: Modifier = Modifier) {
     // Re-sampled on a timer rather than reacting to StreamStats mutation
     // directly (it isn't Compose State) -- polling every 500ms is more than
     // adequate for a human-readable diagnostic overlay, and avoids wiring up
@@ -190,7 +201,7 @@ private fun StatsOverlay(stats: StreamStats, modifier: Modifier = Modifier) {
     ) {
         val statusColor = if (connected) Color(0xFF4CAF50) else Color(0xFFF44336)
         Text(
-            text = if (connected) "● RECEIVING" else "○ WAITING FOR STREAM (TCP $LISTEN_PORT)",
+            text = if (connected) "● RECEIVING" else "○ WAITING FOR STREAM ($waitingLabel)",
             color = statusColor,
             fontSize = 18.sp,
         )
